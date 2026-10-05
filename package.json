@@ -1,0 +1,62 @@
+{
+  "name": "jdb",
+  "version": "0.1.0",
+  "description": "A local, type-safe JSON database engine for Node.js — folders as databases, JSON files as tables.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./elysia": {
+      "types": "./dist/elysia.d.ts",
+      "import": "./dist/elysia.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "Api.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "example": "tsx examples/basic.ts"
+  },
+  "keywords": [
+    "json",
+    "database",
+    "local",
+    "typebox",
+    "elysia",
+    "embedded"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@sinclair/typebox": "^0.34.0",
+    "elysia": "^1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@sinclair/typebox": {
+      "optional": true
+    },
+    "elysia": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@sinclair/typebox": "^0.34.41",
+    "@types/node": "^20.14.0",
+    "elysia": "^1.4.30",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4",
+    "vitest": "^2.1.9"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
