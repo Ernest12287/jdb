@@ -45,6 +45,8 @@ export interface QueryEngine<T extends Record<string, any> = Record<string, any>
   hasCollection(name: string): boolean;
   /** Fill defaults / auto-generate ids before validating an insert. */
   prepareInsert(name: string, data: Partial<T>): T;
+  /** Batch fast-path: many inserts with ONE write/reindex (optional). */
+  insertMany?(name: string, items: T[]): T[];
 }
 
 function getPath(obj: Record<string, unknown>, key: string): unknown {
@@ -102,6 +104,114 @@ function compareValues(a: unknown, b: unknown): number {
   if (typeof a === 'number' && typeof b === 'number') return a - b;
   return String(a) < String(b) ? -1 : 1;
 }
+
+/**
+ * A lazy, thenable proxy around the result array of a mutation (`update`/
+ * `delete`). Reading it like an array (indexing, `.length`, iteration, array
+ * methods, `await`) executes the mutation and forwards to the real result.
+ * Chaining filters (`eq`, `gt`, ...) postpones execution so you can write
+ * either style:
+ *
+ *   db.from('t').eq('id', 1).update({ x: 2 })          // eager filters first
+ *   db.from('t').update({ x: 2 }).eq('id', 1)          // filters after — also works
+ */
+/**
+ * The result of a lazy mutation: usable as `T[]` everywhere, and it also
+ * exposes the chainable filter methods so filters can be added *after*
+ * `.update(...)` / `.delete(...)`. Execution is deferred until the value is
+ * read like an array (indexing, length, iteration, await, array methods).
+ */
+export interface MutationResult<T> extends Array<T> {
+  eq(key: keyof T & string, value: unknown): MutationResult<T>;
+  neq(key: keyof T & string, value: unknown): MutationResult<T>;
+  gt(key: keyof T & string, value: number): MutationResult<T>;
+  lt(key: keyof T & string, value: number): MutationResult<T>;
+  gte(key: keyof T & string, value: number): MutationResult<T>;
+  lte(key: keyof T & string, value: number): MutationResult<T>;
+  like(key: keyof T & string, pattern: string): MutationResult<T>;
+  in(key: keyof T & string, values: unknown[]): MutationResult<T>;
+}
+
+function deferredResult<T extends Record<string, any>>(
+  builder: QueryBuilder<T>,
+  run: () => T[],
+): MutationResult<T> {
+  let executed = false;
+  let result: T[] | null = null;
+  const get = (): T[] => {
+    if (!executed) {
+      result = run();
+      executed = true;
+    }
+    return result as T[];
+  };
+  const handler: ProxyHandler<QueryBuilder<T>> = {
+    get(target, prop, receiver) {
+      if (prop === 'then') {
+        return (onF?: (v: T[]) => unknown, onR?: (e: unknown) => unknown) =>
+          Promise.resolve(get()).then(onF, onR);
+      }
+      if (typeof prop === 'symbol') {
+        // Symbols (iterator, toStringTag, util.inspect...) go to the array.
+        const v = Reflect.get(get(), prop);
+        return typeof v === 'function' ? v.bind(get()) : v;
+      }
+      if (prop === 'constructor') return Object;
+      const chainable = CHAINABLE.has(prop);
+      const value = Reflect.get(target, prop, receiver);
+      if (chainable && typeof value === 'function') {
+        return (...args: unknown[]) => {
+          (value as (...a: unknown[]) => unknown).apply(target, args);
+          return receiver; // keep the proxy so execution stays deferred
+        };
+      }
+      if (typeof value === 'function') {
+        const key = String(prop);
+        return (...args: unknown[]) => {
+          const arrFn = (Array.prototype as unknown as Record<string, Function>)[key];
+          if (typeof arrFn === 'function') return arrFn.apply(get(), args);
+          return (value as (...a: unknown[]) => unknown).apply(get(), args);
+        };
+      }
+      // Non-function properties (length, numeric indices, etc.) read the array.
+      return Reflect.get(get(), prop);
+    },
+    has(target, prop) {
+      return prop in get() || Reflect.has(target, prop);
+    },
+    set(target, prop, value) {
+      if (CHAINABLE.has(String(prop))) {
+        throw new TypeError(`jdb: cannot assign to query method "${String(prop)}".`);
+      }
+      return Reflect.set(get() as object, prop, value);
+    },
+    ownKeys(target) {
+      void target;
+      return Reflect.ownKeys(get());
+    },
+    getOwnPropertyDescriptor(target, prop) {
+      void target;
+      return Reflect.getOwnPropertyDescriptor(get(), prop);
+    },
+    getPrototypeOf() {
+      return Array.prototype;
+    },
+    defineProperty(target, prop, desc) {
+      void target;
+      return Reflect.defineProperty(get(), prop, desc);
+    },
+    deleteProperty(target, prop) {
+      void target;
+      return Reflect.deleteProperty(get(), prop);
+    },
+  };
+  return new Proxy(builder, handler) as unknown as MutationResult<T>;
+}
+
+const CHAINABLE = new Set([
+  'eq', 'neq', 'gt', 'lt', 'gte', 'lte', 'like', 'in',
+  'order', 'limit', 'offset', 'select', 'include',
+]);
 
 export class QueryBuilder<T extends Record<string, any> = Record<string, any>> {
   private readonly engine: QueryEngine<T>;
@@ -189,9 +299,11 @@ export class QueryBuilder<T extends Record<string, any> = Record<string, any>> {
 
   /** All records matching the accumulated filters. */
   all(): T[] {
-    let rows: T[] = this.engine.getRecords(this.collection).filter((r) =>
-      this.filters.every((f) => matchesFilter(r as Record<string, unknown>, f)),
-    );
+    // Copy first: callers must never receive live references into the cache.
+    let rows: T[] = this.engine
+      .getRecords(this.collection)
+      .filter((r) => this.filters.every((f) => matchesFilter(r as Record<string, unknown>, f)))
+      .map((r) => structuredClone(r));
 
     if (this.orderBy.length) {
       rows = [...rows].sort((a, b) => {
@@ -243,6 +355,10 @@ export class QueryBuilder<T extends Record<string, any> = Record<string, any>> {
   /** Insert one record (or an array of records). Validates against the schema. */
   insert(data: Partial<T> | Partial<T>[]): T[] {
     const items = Array.isArray(data) ? data : [data];
+    // Batch fast-path: engine.insertMany does ONE write + ONE reindex.
+    if (items.length > 1 && this.engine.insertMany) {
+      return this.engine.insertMany(this.collection, items as T[]);
+    }
     const records = [...this.engine.getRecords(this.collection)] as T[];
     const inserted: T[] = [];
     for (const item of items) {
@@ -262,13 +378,22 @@ export class QueryBuilder<T extends Record<string, any> = Record<string, any>> {
     return inserted;
   }
 
-  /** Update every record matching the current filters. Returns updated records. */
+  /**
+   * Update every record matching the current filters. Returns updated records.
+   * Lazy: you may keep chaining filters after `.update(...)`; execution is
+   * deferred until the result is read or another terminal method is called.
+   */
   update(data: Partial<T>): T[] {
+    return deferredResult(this, () => this.runUpdate(data));
+  }
+
+  /** @internal eager implementation of update() */
+  private runUpdate(data: Partial<T>): T[] {
     const records = [...this.engine.getRecords(this.collection)] as T[];
     const updated: T[] = [];
     const next = records.map((r) => {
       if (!this.filters.every((f) => matchesFilter(r as Record<string, unknown>, f))) return r;
-      const merged = { ...r, ...data } as T;
+      const merged = { ...structuredClone(r), ...structuredClone(data) } as T;
       this.engine.validateRecord(this.collection, merged);
       updated.push(merged);
       return merged;
@@ -277,8 +402,16 @@ export class QueryBuilder<T extends Record<string, any> = Record<string, any>> {
     return updated;
   }
 
-  /** Delete every record matching the current filters. Returns deleted records. */
+  /**
+   * Delete every record matching the current filters. Returns deleted records.
+   * Lazy like `update()` — filters may be chained after the call.
+   */
   delete(): T[] {
+    return deferredResult(this, () => this.runDelete());
+  }
+
+  /** @internal eager implementation of delete() */
+  private runDelete(): T[] {
     const records = this.engine.getRecords(this.collection) as T[];
     const keep: T[] = [];
     const removed: T[] = [];
@@ -294,7 +427,7 @@ export class QueryBuilder<T extends Record<string, any> = Record<string, any>> {
   upsert(data: Partial<T>, key: keyof T & string = 'id' as keyof T & string): T {
     const existing = this.eq(key, (data as Record<string, unknown>)[key]).first();
     if (existing) {
-      return this.eq(key, (data as Record<string, unknown>)[key]).update(data)[0] as T;
+      return this.eq(key, (data as Record<string, unknown>)[key]).runUpdate(data)[0] as T;
     }
     return this.insert(data)[0] as T;
   }
