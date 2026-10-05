@@ -17,6 +17,7 @@
 -   **Atomic Writes**: Prevents data corruption during crashes using temporary files and atomic renames.
 -   **Auto-Backup**: Optional automatic backup before every write operation.
 -   **In-Memory Indexing**: Lightning-fast lookups even with thousands of records.
+-   **Built-in Visualizer**: Instantly view and manage your data with `jdb.view()`.
 
 ---
 
@@ -158,6 +159,27 @@ const app = new Elysia()
 
 ---
 
+## 🖥️ Built-in Data Viewer (`jdb.view`)
+
+No need for external tools. `jdb` includes a lightweight, Supabase-style dashboard to visualize your live data.
+
+```typescript
+// Start the visualizer on port 3000
+// The server only starts when you access the URL
+db.view({ 
+  port: 3000, 
+  autoOpen: true // Opens browser automatically
+});
+```
+
+**Features:**
+*   **Live Data Grid**: See all your JSON collections in a spreadsheet view.
+*   **Schema Inspector**: View TypeBox definitions for each table.
+*   **Relationship Mapping**: Visually see how `staff_id` links to the `staff` table.
+*   **Read-Only Safety**: Prevents accidental data modification via the UI.
+
+---
+
 ## 📂 Folder Structure
 
 When you run `new JDB('./data')`, your folder looks like this:
@@ -180,6 +202,14 @@ When you run `new JDB('./data')`, your folder looks like this:
 | `autobackup` | `boolean` | `false` | Create a backup copy before every write. |
 | `backupDir` | `string` | `./backups` | Directory to store backup files. |
 | `prettyPrint` | `boolean` | `true` | Format JSON files with indentation for readability. |
+
+### View Configuration
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `port` | `number` | `3000` | Port for the visualizer server. |
+| `autoOpen` | `boolean` | `false` | Open browser automatically on start. |
+| `readOnly` | `boolean` | `true` | Disable editing in the UI for safety. |
 
 ---
 
